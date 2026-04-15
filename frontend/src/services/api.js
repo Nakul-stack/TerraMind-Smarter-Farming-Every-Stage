@@ -2,19 +2,32 @@
  * TerraMind — Frontend API service
  */
 import { API_BASE_URL } from '../config/runtimeConfig';
+import stateDistrictMapping from '../data/state_district_mapping.json';
 
 const API_BASE = API_BASE_URL;
 
 export async function fetchStates() {
-  const res = await fetch(`${API_BASE}/api/states`);
-  const data = await res.json();
-  return data.states || [];
+  try {
+    const res = await fetch(`${API_BASE}/api/states`);
+    const data = await res.json();
+    const states = data.states || [];
+    if (states.length > 0) return states;
+  } catch {
+    // Fall back to bundled map when backend state map is unavailable.
+  }
+  return Object.keys(stateDistrictMapping).sort();
 }
 
 export async function fetchDistricts(state) {
-  const res = await fetch(`${API_BASE}/api/districts/${encodeURIComponent(state)}`);
-  const data = await res.json();
-  return data.districts || [];
+  try {
+    const res = await fetch(`${API_BASE}/api/districts/${encodeURIComponent(state)}`);
+    const data = await res.json();
+    const districts = data.districts || [];
+    if (districts.length > 0) return districts;
+  } catch {
+    // Fall back to bundled map when backend district map is unavailable.
+  }
+  return stateDistrictMapping[state] || [];
 }
 
 export async function predict(payload) {
