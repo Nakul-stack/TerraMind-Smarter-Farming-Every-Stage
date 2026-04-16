@@ -17,7 +17,6 @@ from typing import Any, Dict, Optional
 
 from backend.app.core.runtime_config import DIAGNOSIS_REPORT_TTL_SECONDS
 from app.schemas.diagnosis import DiagnosisResponse, TopPrediction
-from ml.post_symptom_diagnosis.inference.predict import predict_disease
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +55,17 @@ def run_diagnosis(image_bytes: bytes, top_k: int = 3) -> DiagnosisResponse:
         For model loading / inference failures.
     """
     logger.info("Diagnosis service - running inference (top_k=%d)", top_k)
+
+    try:
+        # Lazy import so API startup does not fail when optional ML deps (e.g., torch)
+        # are unavailable in lightweight deployment targets.
+        from ml.post_symptom_diagnosis.inference.predict import predict_disease
+    except ModuleNotFoundError as exc:
+        missing = str(exc).strip()
+        raise RuntimeError(
+            "Diagnosis model dependency is missing in this deployment "
+            f"(details: {missing}). Install the diagnosis runtime dependencies to enable this endpoint."
+        ) from exc
 
     raw: Dict[str, Any] = predict_disease(image_bytes, top_k=top_k)
 
