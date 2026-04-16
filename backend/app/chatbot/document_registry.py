@@ -11,8 +11,6 @@ from typing import List, Optional
 
 import numpy as np
 
-from app.chatbot.ingestion.vector_store import load_index, search as faiss_search
-
 logger = logging.getLogger(__name__)
 
 
@@ -28,12 +26,14 @@ class _Registry:
         if self._loaded:
             return
         logger.info("Loading FAISS index into memory …")
+        from app.chatbot.ingestion.vector_store import load_index
         self._index, self._metadata = load_index()
         self._loaded = True
         logger.info("FAISS index ready  (%d vectors).", self._index.ntotal)
 
     def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[dict]:
         self.ensure_loaded()
+        from app.chatbot.ingestion.vector_store import search as faiss_search
         return faiss_search(self._index, self._metadata, query_embedding, top_k)
 
     @property

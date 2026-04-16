@@ -17,7 +17,6 @@ from backend.app.schemas.chatbot import (
     ChatResponse,
     ChatStatusResponse,
 )
-from backend.app.chatbot.router.orchestrator import orchestrator
 from backend.app.chatbot import document_registry
 from backend.app.chatbot.client import is_available as llm_available
 from backend.app.core.config import OPENROUTER_MODEL_NAME
@@ -55,6 +54,8 @@ async def ask_chatbot(request: Request, body_request: ChatRequest):
         )
 
     try:
+        from backend.app.chatbot.router.orchestrator import orchestrator
+
         diag_env = {
             "identified_crop": body_request.identified_crop,
             "identified_class": body_request.identified_class
