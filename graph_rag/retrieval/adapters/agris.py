@@ -30,10 +30,35 @@ class AgrisAdapter(SourceAdapter):
         )
 
     def build_requests(self, profile: QueryProfile) -> List[Dict]:
+        candidates = [
+            profile.threat_query,
+            profile.crop_query,
+            profile.broad_query,
+            profile.region_query,
+            profile.fallback_query,
+            profile.phrase_query,
+        ]
+
+        # Mandatory query expansion: weather, stage, and epidemiology variants.
+        if profile.crop:
+            weather = " ".join(profile.weather_terms) if profile.weather_terms else ""
+            candidates.extend(
+                [
+                    f"{profile.crop} pest outbreak {weather} {profile.region or ''}".strip(),
+                    f"{profile.crop} disease epidemiology {weather} {profile.growth_stage or ''}".strip(),
+                    f"{profile.crop} integrated pest management {profile.region or ''}".strip(),
+                    f"{profile.crop} fungal disease humidity temperature".strip(),
+                ]
+            )
+
         queries = []
-        for q in [profile.threat_query or profile.broad_query, profile.fallback_query]:
-            if q and q not in queries:
-                queries.append(q)
+        for q in candidates:
+            q = (q or "").strip()
+            if not q or q in queries:
+                continue
+            queries.append(q)
+
+        queries = queries[:10]
 
         return [
             {
@@ -56,13 +81,23 @@ class AgrisAdapter(SourceAdapter):
 
     def _search_local_file(self, profile: QueryProfile) -> (List[Dict], List[SourceCallLog]):
         source_file = self._find_local_source_file()
-        query_text = profile.threat_query or profile.broad_query or profile.fallback_query
+        queries = [
+            q for q in [
+                profile.threat_query,
+                profile.crop_query,
+                profile.broad_query,
+                profile.region_query,
+                profile.fallback_query,
+            ]
+            if q
+        ]
+        query_text = " ".join(queries)[:800] or profile.user_query
         call = SourceCallLog(
             source=self.source_name,
             query=query_text,
             url=str(source_file) if source_file else "local://graph rag source/AGRIS",
             method="FILE",
-            payload={"mode": "local_file"},
+            payload={"mode": "local_file", "query_count": len(queries)},
         )
 
         if source_file is None:

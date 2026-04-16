@@ -7,7 +7,7 @@ prediction dicts into validated Pydantic response objects.
 Also provides:
 - ``report_store``: in-memory dict tracking background LLM report status.
 - ``run_report_generation()``: async background task that produces
-  structured reports via the Graph RAG + Ollama pipeline.
+    structured reports via the Graph RAG + LLM pipeline.
 """
 
 import asyncio
@@ -92,7 +92,7 @@ async def run_report_generation(
 ) -> None:
     """
     Background task: generate a structured diagnosis report via
-    Graph RAG + Ollama and store the result in ``report_store``.
+    Graph RAG + LLM and store the result in ``report_store``.
 
     After storing the result, schedules automatic cleanup of the entry
     after 30 minutes to prevent unbounded memory growth.

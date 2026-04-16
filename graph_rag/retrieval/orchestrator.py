@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import os
 from typing import Dict, List, Optional
 
 from .adapters import default_adapters
@@ -28,6 +29,8 @@ class ExternalRetrievalOrchestrator:
     def __init__(self):
         self.adapters = default_adapters()
         self.logger = RetrievalStructuredLogger()
+        self.min_docs = int(os.getenv("GRAPH_RAG_MIN_RETRIEVAL_DOCS", "5"))
+        self.max_docs = int(os.getenv("GRAPH_RAG_MAX_RETRIEVAL_DOCS", "10"))
 
     def capability_matrix(self) -> List[Dict]:
         return [a.capability().__dict__ for a in self.adapters]
@@ -96,11 +99,24 @@ class ExternalRetrievalOrchestrator:
         if agris_primary:
             selected_primary = agris_primary + other_primary[:2]
             enrichment_cap = min(4, max(2, len(selected_primary) // 2))
-            return selected_primary + enrichment_docs[:enrichment_cap]
-
-        if primary_docs:
+            selected = selected_primary + enrichment_docs[:enrichment_cap]
+        elif primary_docs:
             enrichment_cap = min(4, max(2, len(primary_docs) // 2))
-            return primary_docs + enrichment_docs[:enrichment_cap]
+            selected = primary_docs + enrichment_docs[:enrichment_cap]
+        else:
+            # If primary evidence is unavailable, return a small enrichment fallback set.
+            selected = enrichment_docs[:4]
 
-        # If primary evidence is unavailable, return a small enrichment fallback set.
-        return enrichment_docs[:4]
+        # Ensure a useful evidence floor (5+) whenever ranked docs are available.
+        selected_keys = {(d.source.lower(), d.title.lower(), d.url.lower()) for d in selected}
+        if len(selected) < self.min_docs:
+            for doc in ranked_docs:
+                key = (doc.source.lower(), doc.title.lower(), doc.url.lower())
+                if key in selected_keys:
+                    continue
+                selected.append(doc)
+                selected_keys.add(key)
+                if len(selected) >= self.min_docs:
+                    break
+
+        return selected[: max(self.min_docs, self.max_docs)]

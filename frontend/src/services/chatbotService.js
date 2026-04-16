@@ -41,7 +41,7 @@ export const chatbotService = {
   },
 
   /**
-   * Check chatbot system status (index loaded, Ollama available).
+    * Check chatbot system status (index loaded, LLM available).
    * @returns {Promise<object>}
    */
   getStatus: async () => {

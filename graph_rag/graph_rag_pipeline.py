@@ -7,6 +7,8 @@ from typing import Dict, Optional
 
 import requests
 
+from app.chatbot.client import generate as llm_generate, OllamaError
+
 from .graph_builder import AgroKGBuilder
 from .intent_parser import IntentParser, ParsedIntent
 from .query_engine import GraphQueryEngine
@@ -41,15 +43,25 @@ class GraphRAGPipeline:
         ollama_model: Optional[str] = None,
     ):
         self.ollama_base_url = ollama_base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        self.ollama_model = ollama_model or os.getenv("GRAPH_RAG_MODEL", "qwen2.5:7b-q4")
+        self.ollama_model = ollama_model or os.getenv(
+            "GRAPH_RAG_MODEL",
+            os.getenv("OPENROUTER_MODEL_NAME", os.getenv("GEMINI_MODEL_NAME", "z-ai/glm-4.5-air:free")),
+        )
         self.ollama_fallback_model = os.getenv(
             "GRAPH_RAG_FALLBACK_MODEL",
-            os.getenv("OLLAMA_MODEL_NAME", "qwen2.5:1.5b"),
+            "",
         )
+        self.ollama_model_candidates = [
+            x.strip()
+            for x in os.getenv("GRAPH_RAG_MODEL_CANDIDATES", "").split(",")
+            if x.strip()
+        ]
         self.ollama_timeout = int(os.getenv("GRAPH_RAG_OLLAMA_TIMEOUT", "300"))
         self.ollama_max_wait_seconds = int(os.getenv("GRAPH_RAG_OLLAMA_MAX_WAIT", "0"))
         self.ollama_connect_timeout = float(os.getenv("GRAPH_RAG_OLLAMA_CONNECT_TIMEOUT", "10"))
         self.ollama_retries = max(0, int(os.getenv("GRAPH_RAG_OLLAMA_RETRIES", "1")))
+        self.graph_rag_llm_max_tokens = int(os.getenv("GRAPH_RAG_LLM_MAX_TOKENS", "1200"))
+        self.graph_rag_llm_retry_max_tokens = int(os.getenv("GRAPH_RAG_LLM_RETRY_MAX_TOKENS", "1600"))
         self.enable_external_sources = os.getenv("GRAPH_RAG_ENABLE_EXTERNAL_SOURCES", "true").lower() in {
             "1", "true", "yes", "on"
         }
@@ -64,8 +76,8 @@ class GraphRAGPipeline:
         self.external_orchestrator = ExternalRetrievalOrchestrator()
 
     def run(self, user_query: str, use_llm: bool = True) -> Dict:
-        is_agri_query = self._is_agriculture_query(user_query)
         parsed: ParsedIntent = self.intent_parser.parse(user_query)
+        is_agri_query = self._is_agriculture_query(user_query, parsed)
 
         qctx = self.query_engine.query(
             crop_name=parsed.crop,
@@ -210,38 +222,21 @@ class GraphRAGPipeline:
         external_context_text: str,
     ) -> str:
         prompt = self._build_prompt(user_query, parsed, kg_context_text, external_context_text)
-        payload = {
-            "model": self.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "20m",
-            "options": {
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "num_ctx": 4096,
-                "num_predict": 520,
-            },
-        }
-
-        url = f"{self.ollama_base_url.rstrip('/')}/api/generate"
         try:
-            r = self._post_with_retry(url, payload, max_wait_seconds=self.ollama_max_wait_seconds)
-            r.raise_for_status()
-            data = r.json()
-            answer = (data.get("response") or "").strip()
+            answer = llm_generate(prompt, self.ollama_model, self.graph_rag_llm_max_tokens)
             if answer:
                 return self._finalize_answer(
                     answer,
-                    url,
+                    "",
                     user_query,
                     parsed,
                     kg_context_text,
                     external_context_text,
                 )
             return self._fallback_response(parsed, kg_context_text)
-        except requests.exceptions.ReadTimeout as exc:
+        except OllamaError as exc:
             fallback_answer = self._try_fallback_model(
-                url,
+                exc,
                 user_query,
                 parsed,
                 kg_context_text,
@@ -250,20 +245,24 @@ class GraphRAGPipeline:
             if fallback_answer:
                 return self._finalize_answer(
                     fallback_answer,
-                    url,
+                    "",
                     user_query,
                     parsed,
                     kg_context_text,
                     external_context_text,
                 )
+            reason = str(exc).strip()
+            if len(reason) > 320:
+                reason = reason[:320].rstrip() + "..."
+
             return (
-                "Graph context is available, but local LLM generation timed out. "
-                f"Model '{self.ollama_model}' exceeded {self.ollama_max_wait_seconds}s.\n\n"
+                "Graph context is available, but OpenRouter generation failed for the current model and fallbacks. "
+                f"Reason: {reason}\n\n"
                 + self._fallback_response(parsed, kg_context_text)
             )
         except Exception as exc:
             return (
-                "Graph context is available, but local LLM generation failed. "
+                "Graph context is available, but OpenRouter generation failed. "
                 f"Reason: {exc}.\n\n"
                 + self._fallback_response(parsed, kg_context_text)
             )
@@ -347,43 +346,44 @@ class GraphRAGPipeline:
 
     def _try_fallback_model(
         self,
-        url: str,
+        triggering_error: Exception,
         user_query: str,
         parsed: ParsedIntent,
         kg_context_text: str,
         external_context_text: str,
     ) -> Optional[str]:
-        fallback_model = (self.ollama_fallback_model or "").strip()
-        if not fallback_model or fallback_model == self.ollama_model:
+        prompt = self._build_prompt(user_query, parsed, kg_context_text, external_context_text)
+        current = (self.ollama_model or "").strip()
+        fallbacks = []
+
+        if self.ollama_fallback_model:
+            fallbacks.append(self.ollama_fallback_model.strip())
+        fallbacks.extend(self.ollama_model_candidates)
+
+        # Safe default candidates when running OpenRouter free-tier models.
+        if current == "z-ai/glm-4.5-air:free":
+            fallbacks.extend(["z-ai/glm-4.5-air:free"])
+
+        # Preserve order and remove duplicates/primary model.
+        unique_candidates = []
+        seen = set()
+        for model in fallbacks:
+            if not model or model == current or model in seen:
+                continue
+            seen.add(model)
+            unique_candidates.append(model)
+
+        if not unique_candidates:
             return None
 
-        fallback_prompt = self._build_prompt(user_query, parsed, kg_context_text, external_context_text)
-        fallback_payload = {
-            "model": fallback_model,
-            "prompt": fallback_prompt,
-            "stream": False,
-            "keep_alive": "20m",
-            "options": {
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "num_ctx": 3072,
-                "num_predict": 340,
-            },
-        }
+        for fallback_model in unique_candidates:
+            try:
+                answer = llm_generate(prompt, fallback_model, max(1000, self.graph_rag_llm_max_tokens - 120))
+                if answer:
+                    return answer
+            except Exception:
+                continue
 
-        try:
-            r = self._post_with_retry(
-                url,
-                fallback_payload,
-                max_wait_seconds=min(45, self.ollama_max_wait_seconds),
-            )
-            r.raise_for_status()
-            data = r.json()
-            answer = (data.get("response") or "").strip()
-            if answer:
-                return answer
-        except Exception:
-            return None
         return None
 
     def _build_prompt(
@@ -394,15 +394,15 @@ class GraphRAGPipeline:
         external_context_text: str,
     ) -> str:
         safety_lines = [
-            "You are an intelligent Agriculture Research Assistant.",
-            "Primary evidence source is AGRIS (FAO agricultural research database).",
-            "Use retrieval-augmented generation and graph-based reasoning for agriculture queries.",
-            "If query is not agriculture-related, answer normally and do NOT rely on AGRIS retrieval.",
-            "For agriculture queries, prioritize AGRIS evidence; use complementary sources only for graph enrichment and validation.",
-            "Do not hallucinate papers, datasets, or results. If evidence is limited, state reduced confidence clearly.",
-            "Prefer recent evidence (after 2015), strong relevance, and cross-source consistency.",
-            "Focus on practical, scientifically consistent, and actionable guidance.",
-            "Avoid raw citations unless explicitly requested.",
+            "You are an advanced agricultural intelligence assistant.",
+            "AGRIS (FAO) is your PRIMARY scientific source.",
+            "Your output must be specific, non-generic, field-actionable, and decision-ready.",
+            "Never stop at low confidence. Provide best possible actionable guidance using AGRIS + labeled expert inference.",
+            "If a point is not directly supported by AGRIS, label it as Expert inference.",
+            "Always connect weather -> biology -> crop impact.",
+            "Always include specific pest/disease names (common + scientific when possible).",
+            "Use active ingredient names for chemical control where applicable.",
+            "Prefer recent research (last 10-15 years) but include older high-quality epidemiology when needed.",
         ]
 
         parsed_block = json.dumps(asdict(parsed), ensure_ascii=True, indent=2)
@@ -418,13 +418,41 @@ class GraphRAGPipeline:
             + "EXTERNAL RESEARCH CONTEXT (AGRIS primary + enrichment datasets/sources):\n"
             + (external_context_text or "(no external context used)")
             + "\n\n"
-            + "Generate final answer with this structure:\n"
-            + "1) Concept explanation\n"
-            + "2) Research-backed insights (AGRIS-first, then supporting sources)\n"
-            + "3) Graph-derived insights (key relationships and why they matter)\n"
-            + "4) Practical recommendations (ordered, measurable if possible)\n"
-            + "5) Optional comparisons (methods/models/inputs) when relevant\n"
-            + "6) Confidence note (especially when AGRIS evidence is limited)\n"
+            + "RETRIEVAL STRATEGY (MANDATORY):\n"
+            + "- Use expanded scientific keywords: crop common+scientific, pest/disease, weather, region, crop stage.\n"
+            + "- Reformulate into multiple sub-queries and synthesize across them.\n"
+            + "- Target 5-10 relevant records; if weak evidence, broaden with synonyms and related terms.\n"
+            + "- Filter weak metadata-only signals and prioritize entries with useful abstract evidence.\n"
+            + "\n"
+            + "GRAPH-BASED REASONING (MANDATORY):\n"
+            + "- Build links: Crop -> pests/diseases, Weather -> activation, Region -> outbreak patterns.\n"
+            + "- Rank risk by environmental suitability, epidemiology, and growth stage vulnerability.\n"
+            + "\n"
+            + "OUTPUT FORMAT (STRICT):\n"
+            + "1) Identified High-Risk Pests/Diseases\n"
+            + "- Name (common + scientific if possible)\n"
+            + "- Risk Level: High / Medium / Low\n"
+            + "- Why: weather + crop stage linkage\n"
+            + "\n"
+            + "2) Weather-Disease/Pest Link\n"
+            + "- Explain mechanistic effect of humidity/temperature/rainfall on outbreak\n"
+            + "\n"
+            + "3) AGRIS Evidence (NOT GENERIC)\n"
+            + "- Summarize 2-3 specific findings with region/year context when available\n"
+            + "\n"
+            + "4) If AGRIS is insufficient\n"
+            + "- Explicitly state limitations\n"
+            + "- Add labeled expert-backed insights\n"
+            + "\n"
+            + "5) Actionable Recommendations\n"
+            + "- Monitoring: exactly what to scout and thresholds/signs\n"
+            + "- Preventive practices\n"
+            + "- Chemical control: active ingredients and resistance-rotation notes\n"
+            + "\n"
+            + "STRICT RULES:\n"
+            + "- Do not provide generic textbook advice.\n"
+            + "- Always provide useful field-level actions.\n"
+            + "- Always connect evidence to the user's query context.\n"
         )
 
     def _build_general_prompt(self, user_query: str) -> str:
@@ -435,41 +463,94 @@ class GraphRAGPipeline:
         )
 
     def _generate_general_response(self, user_query: str) -> str:
-        payload = {
-            "model": self.ollama_model,
-            "prompt": self._build_general_prompt(user_query),
-            "stream": False,
-            "keep_alive": "20m",
-            "options": {
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "num_ctx": 2048,
-                "num_predict": 320,
-            },
-        }
-
-        url = f"{self.ollama_base_url.rstrip('/')}/api/generate"
         try:
-            r = self._post_with_retry(url, payload, max_wait_seconds=self.ollama_max_wait_seconds)
-            r.raise_for_status()
-            data = r.json()
-            answer = (data.get("response") or "").strip()
+            answer = llm_generate(self._build_general_prompt(user_query), self.ollama_model, 320)
             if answer:
-                return answer
+                cleaned = answer.strip()
+                if self._looks_truncated(cleaned):
+                    retry_prompt = (
+                        self._build_general_prompt(user_query)
+                        + "\n\nIMPORTANT: Provide a complete answer and finish all sentences."
+                    )
+                    retried = llm_generate(retry_prompt, self.ollama_model, 520)
+                    if retried:
+                        cleaned = retried.strip()
+
+                if self._looks_truncated(cleaned):
+                    cleaned = self._append_general_completion(cleaned)
+
+                return cleaned
         except Exception:
             pass
 
         return "I can help with that. Please share a bit more detail so I can give a precise answer."
 
-    def _is_agriculture_query(self, user_query: str) -> bool:
+    def _is_agriculture_query(self, user_query: str, parsed: Optional[ParsedIntent] = None) -> bool:
         text = (user_query or "").lower()
         if not text.strip():
             return False
 
+        # Prefer parsed intent/entities when available to reduce false negatives.
+        if parsed is not None:
+            if any([
+                bool(parsed.crop),
+                bool(parsed.pest),
+                bool(parsed.disease),
+                bool(parsed.soil_type),
+                bool(parsed.pesticide),
+                bool(parsed.climate_conditions),
+            ]):
+                return True
+
+            intent_type = str(getattr(parsed, "intent_type", "") or "").lower()
+            if any(token in intent_type for token in ["crop", "pest", "disease", "soil", "fert", "irrig", "agri"]):
+                return True
+
         for pattern in self._AGRI_DOMAIN_PATTERNS:
             if re.search(pattern, text):
                 return True
+
+        # Lightweight lexical fallback for common crop/pest wording.
+        agri_terms = {
+            "cotton", "rice", "wheat", "maize", "corn", "sugarcane", "soybean",
+            "chickpea", "mustard", "groundnut", "tomato", "potato", "onion",
+            "aphid", "thrips", "whitefly", "bollworm", "stem borer", "leafhopper",
+            "fungicide", "insecticide", "herbicide", "spray", "field", "farm",
+        }
+        if any(term in text for term in agri_terms):
+            return True
+
         return False
+
+    def _looks_truncated(self, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return True
+
+        if stripped.endswith(":"):
+            return True
+
+        if re.search(r"\*\*$", stripped):
+            return True
+
+        if re.search(r"\b(and|or|with|for|in|on|to|during|under|requires|include|includes)\s*$", stripped, flags=re.IGNORECASE):
+            return True
+
+        if not re.search(r"[.!?]$", stripped):
+            return True
+
+        return False
+
+    def _append_general_completion(self, text: str) -> str:
+        cleaned = (text or "").rstrip()
+        cleaned = re.sub(r"\*\*$", "", cleaned).rstrip()
+        if not cleaned:
+            return "Here is a complete summary: use integrated pest management with regular scouting, threshold-based intervention, and label-compliant products."
+
+        if not re.search(r"[.!?]$", cleaned):
+            cleaned += "."
+        cleaned += " Consider local extension guidance, resistance rotation, and pre-harvest interval rules before application."
+        return cleaned
 
     def _build_external_context(self, user_query: str, parsed: ParsedIntent, has_local_kb_context: bool):
         default_meta = {
@@ -680,30 +761,10 @@ class GraphRAGPipeline:
     ) -> Optional[str]:
         retry_prompt = (
             self._build_prompt(user_query, parsed, kg_context_text, external_context_text)
-            + "\nIMPORTANT: Provide a complete final answer with all six sections and no unfinished bullets."
+            + "\nIMPORTANT: Provide a complete final answer with all five required sections and no unfinished bullets."
         )
-        retry_payload = {
-            "model": self.ollama_model,
-            "prompt": retry_prompt,
-            "stream": False,
-            "keep_alive": "20m",
-            "options": {
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "num_ctx": 4096,
-                "num_predict": 760,
-            },
-        }
-
         try:
-            r = self._post_with_retry(
-                url,
-                retry_payload,
-                max_wait_seconds=min(50, self.ollama_max_wait_seconds),
-            )
-            r.raise_for_status()
-            data = r.json()
-            candidate = (data.get("response") or "").strip()
+            candidate = llm_generate(retry_prompt, self.ollama_model, self.graph_rag_llm_retry_max_tokens)
             if candidate and not self._is_incomplete_response(candidate):
                 return candidate
         except Exception:
@@ -716,11 +777,11 @@ class GraphRAGPipeline:
             return True
 
         required_sections = [
-            "Concept explanation",
-            "Research-backed insights",
-            "Graph-derived insights",
-            "Practical recommendations",
-            "Confidence note",
+            "Identified High-Risk Pests/Diseases",
+            "Weather-Disease/Pest Link",
+            "AGRIS Evidence",
+            "If AGRIS is insufficient",
+            "Actionable Recommendations",
         ]
         missing_sections = [s for s in required_sections if s.lower() not in stripped.lower()]
         if missing_sections:
@@ -771,10 +832,18 @@ class GraphRAGPipeline:
             flags=re.IGNORECASE,
         )
 
-        if "Confidence note".lower() not in cleaned.lower():
+        if "If AGRIS is insufficient".lower() not in cleaned.lower():
             cleaned += (
-                "\n\n6) Confidence note\n"
-                "- Confidence is moderate unless AGRIS and enrichment sources converge on the same recommendation."
+                "\n\n4) If AGRIS is insufficient\n"
+                "- AGRIS evidence may be sparse for this exact condition; recommendations include labeled expert inference where needed."
+            )
+
+        if "Actionable Recommendations".lower() not in cleaned.lower():
+            cleaned += (
+                "\n\n5) Actionable Recommendations\n"
+                "- Monitoring: scout twice weekly for early lesions/insect hotspots in lower canopy and field edges.\n"
+                "- Preventive practices: improve aeration, avoid excess nitrogen, and remove heavily infected plant debris.\n"
+                "- Chemical control: rotate mode of action and follow label dose/PHI with local extension guidance."
             )
 
         return cleaned

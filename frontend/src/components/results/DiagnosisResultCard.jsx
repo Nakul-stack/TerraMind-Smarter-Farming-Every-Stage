@@ -187,7 +187,7 @@ export default function DiagnosisResultCard({
                       <span className="text-xs font-black uppercase">Report Generation Timeout</span>
                     </div>
                     <p className="text-[11px] text-amber-200/90 leading-relaxed">
-                      {reportErrorMessage || 'The report is taking too long. Check Ollama/model readiness and retry diagnosis.'}
+                      {reportErrorMessage || 'The report is taking too long. Check LLM/model readiness and retry diagnosis.'}
                     </p>
                   </div>
                 )}

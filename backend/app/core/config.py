@@ -9,9 +9,18 @@ sensible defaults that work on modest local hardware (i7-11 / MX330 / 32 GB).
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency safety
+    load_dotenv = None
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 # Project root is two levels above this file: backend/app/core/config.py -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+if load_dotenv is not None:
+    # Load root .env once so os.getenv values are available in all modules.
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 PDF_FOLDER_PATH: str = os.getenv(
     "TERRAMIND_PDF_FOLDER",
@@ -31,11 +40,30 @@ EMBEDDING_MODEL_NAME: str = os.getenv(
     "all-MiniLM-L6-v2",
 )
 
-# ── Ollama / LLM ────────────────────────────────────────────────────────────
-# qwen2.5:1.5b - ~1.1 GB download, ~1.5 GB RAM at runtime.
-# 15-25 tok/s on i7 CPU.  Perfect for rewriting retrieved context.
-OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL_NAME: str = os.getenv("OLLAMA_MODEL_NAME", "qwen2.5:1.5b")
+# ── OpenRouter / LLM ────────────────────────────────────────────────────────
+# Keep API keys server-side only; never expose to frontend code.
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL_NAME: str = os.getenv(
+    "OPENROUTER_MODEL_NAME",
+    os.getenv("GEMINI_MODEL_NAME", os.getenv("OLLAMA_MODEL_NAME", "z-ai/glm-4.5-air:free")),
+)
+OPENROUTER_TEMPERATURE: float = float(
+    os.getenv("OPENROUTER_TEMPERATURE", os.getenv("GEMINI_TEMPERATURE", os.getenv("OLLAMA_TEMPERATURE", "0.3")))
+)
+OPENROUTER_TIMEOUT_SECONDS: int = int(
+    os.getenv("OPENROUTER_TIMEOUT", os.getenv("GEMINI_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "120")))
+)
+OPENROUTER_REASONING_EFFORT: str = os.getenv("OPENROUTER_REASONING_EFFORT", "low").strip().lower()
+
+# Compatibility aliases used by existing imports and schema fields.
+GEMINI_API_KEY: str = OPENROUTER_API_KEY
+GEMINI_MODEL_NAME: str = OPENROUTER_MODEL_NAME
+GEMINI_TEMPERATURE: float = OPENROUTER_TEMPERATURE
+GEMINI_TIMEOUT_SECONDS: int = OPENROUTER_TIMEOUT_SECONDS
+
+# Legacy compatibility exports (older modules still import OLLAMA_*).
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "")
+OLLAMA_MODEL_NAME: str = OPENROUTER_MODEL_NAME
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
 # 500-char chunks with 50-char overlap keeps retrieval precise while giving
@@ -51,7 +79,7 @@ MAX_CONTEXT_CHUNKS: int = int(os.getenv("TERRAMIND_MAX_CONTEXT_CHUNKS", "5"))
 # irrelevant and the chatbot will refuse to answer.
 SIMILARITY_THRESHOLD: float = float(os.getenv("TERRAMIND_SIM_THRESHOLD", "0.35"))
 
-# ── Ollama generation parameters ────────────────────────────────────────────
-OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.3"))
+# ── LLM generation parameters ───────────────────────────────────────────────
+OLLAMA_TEMPERATURE: float = OPENROUTER_TEMPERATURE
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
-OLLAMA_TIMEOUT_SECONDS: int = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+OLLAMA_TIMEOUT_SECONDS: int = OPENROUTER_TIMEOUT_SECONDS

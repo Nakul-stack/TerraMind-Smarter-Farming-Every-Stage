@@ -79,7 +79,7 @@ export default function Diagnosis() {
         if (Date.now() - pollStartRef.current > POLL_TIMEOUT_MS) {
           stopPolling();
           setReportStatus('timeout');
-          setReportErrorMessage('Report generation is taking longer than expected. Please try diagnosis again or verify Ollama/model availability.');
+          setReportErrorMessage('Report generation is taking longer than expected. Please try diagnosis again or verify LLM/model availability.');
           return;
         }
 

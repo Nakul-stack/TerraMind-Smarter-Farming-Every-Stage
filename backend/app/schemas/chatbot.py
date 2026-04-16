@@ -69,5 +69,9 @@ class ChatStatusResponse(BaseModel):
     """Health check / status response for the chatbot subsystem."""
     index_loaded: bool
     total_chunks: int
-    ollama_available: bool
-    ollama_model: str
+    llm_available: bool
+    llm_model: str
+    llm_provider: str = "openrouter"
+    # Deprecated compatibility fields.
+    ollama_available: Optional[bool] = None
+    ollama_model: Optional[str] = None

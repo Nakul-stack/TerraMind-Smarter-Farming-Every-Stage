@@ -19,8 +19,8 @@ from backend.app.schemas.chatbot import (
 )
 from backend.app.chatbot.router.orchestrator import orchestrator
 from backend.app.chatbot import document_registry
-from backend.app.chatbot.client import is_available as ollama_available
-from backend.app.core.config import OLLAMA_MODEL_NAME
+from backend.app.chatbot.client import is_available as llm_available
+from backend.app.core.config import OPENROUTER_MODEL_NAME
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -86,14 +86,19 @@ async def ask_chatbot(request: Request, body_request: ChatRequest):
     "/status",
     response_model=ChatStatusResponse,
     summary="Chatbot system status",
-    description="Check whether the vector index is loaded and Ollama is available.",
+    description="Check whether the vector index is loaded and the configured LLM is available.",
 )
 def chatbot_status():
+    available = llm_available()
     return ChatStatusResponse(
         index_loaded=document_registry.is_loaded(),
         total_chunks=document_registry.total_chunks(),
-        ollama_available=ollama_available(),
-        ollama_model=OLLAMA_MODEL_NAME,
+        llm_available=available,
+        llm_model=OPENROUTER_MODEL_NAME,
+        llm_provider="openrouter",
+        # Deprecated compatibility fields.
+        ollama_available=available,
+        ollama_model=OPENROUTER_MODEL_NAME,
     )
 
 

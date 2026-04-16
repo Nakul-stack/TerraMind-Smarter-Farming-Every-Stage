@@ -1,11 +1,10 @@
 """
-Ollama Client
-=============
-Thin HTTP wrapper around the Ollama REST API (``/api/generate``).
+OpenRouter Client
+=================
+Thin HTTP wrapper around OpenRouter chat completions API.
 
-Uses ``httpx`` for a clean sync interface with configurable timeouts.
-The MX330 GPU is too small for LLM inference, so the model runs on CPU;
-we use a generous timeout to account for that.
+Uses ``httpx`` for a synchronous interface with configurable timeouts.
+API keys are read from backend environment variables only.
 """
 
 import logging
@@ -14,23 +13,44 @@ from typing import Optional
 import httpx
 
 from app.core.config import (
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL_NAME,
-    OLLAMA_TEMPERATURE,
-    OLLAMA_NUM_CTX,
-    OLLAMA_TIMEOUT_SECONDS,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MODEL_NAME,
+    OPENROUTER_REASONING_EFFORT,
+    OPENROUTER_TEMPERATURE,
+    OPENROUTER_TIMEOUT_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class OllamaError(RuntimeError):
-    """Raised when Ollama is unreachable or returns an error."""
+class LLMError(RuntimeError):
+    """Raised when OpenRouter is unreachable or returns an error."""
+
+
+# Backward-compatible alias for existing imports.
+OllamaError = LLMError
+
+
+def _extract_answer_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if txt:
+                    parts.append(str(txt))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts).strip()
+    return ""
 
 
 def generate(prompt: str, model: Optional[str] = None, num_predict: Optional[int] = None) -> str:
     """
-    Send a prompt to Ollama and return the generated text.
+    Send a prompt to OpenRouter and return the generated text.
 
     Parameters
     ----------
@@ -39,70 +59,121 @@ def generate(prompt: str, model: Optional[str] = None, num_predict: Optional[int
     model : str, optional
         Override the default model name.
     num_predict : int, optional
-        Maximum number of tokens to generate.  When ``None``, Ollama uses
-        its own default (unlimited).  Set to ~1200-1500 for capped output.
+        Maximum number of tokens to generate. When ``None``, provider defaults are used.
 
     Returns
     -------
     str
         The LLM-generated answer text.
     """
-    model_name = model or OLLAMA_MODEL_NAME
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+    if not OPENROUTER_API_KEY:
+        raise LLMError("OPENROUTER_API_KEY is not configured on the backend.")
 
-    options = {
-        "temperature": OLLAMA_TEMPERATURE,
-        "num_ctx": OLLAMA_NUM_CTX,
-    }
-    if num_predict is not None:
-        options["num_predict"] = num_predict
-
+    model_name = model or OPENROUTER_MODEL_NAME
     payload = {
         "model": model_name,
-        "prompt": prompt,
-        "stream": False,
-        "options": options,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": OPENROUTER_TEMPERATURE,
+    }
+    if OPENROUTER_REASONING_EFFORT in {"low", "medium", "high"}:
+        payload["reasoning"] = {"effort": OPENROUTER_REASONING_EFFORT}
+    if num_predict is not None:
+        payload["max_tokens"] = int(num_predict)
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
     }
 
     try:
-        logger.info("Sending request to Ollama [%s] …", model_name)
-        with httpx.Client(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
-            resp = client.post(url, json=payload)
+        logger.info("Sending request to OpenRouter [%s] ...", model_name)
+        with httpx.Client(timeout=OPENROUTER_TIMEOUT_SECONDS) as client:
+            resp = client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
             resp.raise_for_status()
-    except httpx.ConnectError:
-        raise OllamaError(
-            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            "Is Ollama running?  Start it with: ollama serve"
-        )
+    except httpx.ConnectError as exc:
+        raise LLMError("Cannot connect to OpenRouter API endpoint.") from exc
     except httpx.TimeoutException:
-        raise OllamaError(
-            f"Ollama request timed out after {OLLAMA_TIMEOUT_SECONDS}s. "
-            "The model may be too large for your hardware or still loading."
+        raise LLMError(
+            f"OpenRouter request timed out after {OPENROUTER_TIMEOUT_SECONDS}s."
         )
     except httpx.HTTPStatusError as exc:
-        raise OllamaError(f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text}")
+        raise LLMError(f"OpenRouter returned HTTP {exc.response.status_code}: {exc.response.text}")
 
     data = resp.json()
-    answer = data.get("response", "").strip()
-    logger.info(
-        "Ollama responded — %d chars, eval_duration=%.1fs",
-        len(answer),
-        data.get("eval_duration", 0) / 1e9,
-    )
+    choices = data.get("choices") or []
+    if not choices:
+        raise LLMError("OpenRouter returned no choices.")
+
+    message = choices[0].get("message") or {}
+    answer = _extract_answer_text(message)
+    finish_reason = choices[0].get("finish_reason")
+
+    # Some free-tier reasoning models spend most tokens on hidden reasoning and clip visible output.
+    if finish_reason == "length" and len(answer) < 260:
+        retry_max_tokens = max(1200, int((num_predict or 600) * 2))
+        retry_payload = dict(payload)
+        retry_payload["max_tokens"] = min(retry_max_tokens, 2400)
+        retry_payload["messages"] = [
+            {
+                "role": "user",
+                "content": prompt + "\n\nIMPORTANT: Return only final answer text with concise section bullets. Avoid long internal reasoning.",
+            }
+        ]
+        try:
+            with httpx.Client(timeout=OPENROUTER_TIMEOUT_SECONDS) as client:
+                retry_resp = client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=retry_payload,
+                )
+                retry_resp.raise_for_status()
+            retry_data = retry_resp.json()
+            retry_choices = retry_data.get("choices") or []
+            if retry_choices:
+                retry_message = retry_choices[0].get("message") or {}
+                retry_answer = _extract_answer_text(retry_message)
+                if len(retry_answer) > len(answer):
+                    answer = retry_answer
+                    data = retry_data
+                    choices = retry_choices
+                    finish_reason = retry_choices[0].get("finish_reason")
+        except Exception:
+            pass
+
+    if not answer:
+        usage = data.get("usage") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        reasoning_tokens = completion_details.get("reasoning_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        raise LLMError(
+            "OpenRouter returned empty text "
+            f"(finish_reason={finish_reason}, completion_tokens={completion_tokens}, reasoning_tokens={reasoning_tokens})."
+        )
+
+    logger.info("OpenRouter responded - %d chars", len(answer))
     return answer
 
 
 def is_available() -> bool:
-    """Check whether Ollama is reachable and the configured model is present."""
+    """Check whether OpenRouter key appears valid and provider reachable."""
+    if not OPENROUTER_API_KEY:
+        return False
+
     try:
         with httpx.Client(timeout=5) as client:
-            resp = client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            if resp.status_code != 200:
-                return False
-            models = [m["name"] for m in resp.json().get("models", [])]
-            # Ollama model names may have a ":latest" suffix
-            return any(
-                OLLAMA_MODEL_NAME in m for m in models
+            resp = client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             )
+            return resp.status_code == 200
     except Exception:
         return False

@@ -366,8 +366,8 @@ def _extract_fastapi_endpoints(content: str) -> List[Tuple[str, str]]:
 
 def _build_external_nodes(nodes: Dict[str, Dict[str, Any]], edges: List[Dict[str, Any]]) -> None:
     external_defs = {
-        "external::ollama": {
-            "label": "Ollama LLM Runtime",
+        "external::llm": {
+            "label": "Gemini / LLM Runtime",
             "role": "external_service",
         },
         "external::vector_store": {
@@ -405,10 +405,10 @@ def _build_external_nodes(nodes: Dict[str, Dict[str, Any]], edges: List[Dict[str
         text_blob = " ".join(node.get("dependencies", []) + node.get("metadata", {}).get("api_calls", []))
         lower_blob = text_blob.lower()
 
-        if "ollama" in lower_blob or "api/generate" in lower_blob:
+        if "ollama" in lower_blob or "gemini" in lower_blob or "api/generate" in lower_blob:
             edges.append({
                 "source": node["id"],
-                "target": "external::ollama",
+                "target": "external::llm",
                 "type": "integration",
                 "label": "llm",
             })

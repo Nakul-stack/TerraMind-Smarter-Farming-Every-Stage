@@ -1,9 +1,8 @@
-import os
-import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from backend.core.logging_config import log
+from backend.app.chatbot.client import is_available as llm_available
 from graph_rag.graph_rag_pipeline import GraphRAGPipeline
 
 router = APIRouter()
@@ -36,24 +35,12 @@ def query_graph_rag(req: QueryRequest):
 def graph_rag_health():
     try:
         pipeline = get_pipeline()
-        status = "ok"
+        status = "ok" if llm_available() else "degraded (openrouter unavailable or API key missing)"
         model = pipeline.ollama_model
-        
-        try:
-            url = f"{pipeline.ollama_base_url.rstrip('/')}/api/tags"
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                tags = r.json().get("models", [])
-                # Check if model exists locally
-                if not any(model in t.get("name", "") for t in tags):
-                    status = "degraded (model not found)"
-            else:
-                status = "degraded (ollama error)"
-        except Exception:
-            status = "degraded (ollama config/connection error)"
-            
+
         return {
             "status": status,
+            "provider": "openrouter",
             "model": model,
             "kg_nodes": len(pipeline.kg_builder.G.nodes) if pipeline.kg_builder.G else 0
         }
